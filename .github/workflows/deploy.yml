@@ -1,0 +1,167 @@
+# Деплой collector при push в main: CI → образ в GHCR → ручное подтверждение → pull на сервере.
+# Секреты: Settings → Secrets and variables → Actions → Repository secrets
+#   VPS_SSH_HOST, VPS_SSH_USER, VPS_SSH_PRIVATE_KEY
+#   VPS_DEPLOY_PATH — корень клона репозитория на сервере (compose лежит в docker/)
+# Окружение: Settings → Environments → production → Required reviewers.
+#
+# Документация: docs/deployment_cicd.md
+
+name: Deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - src/**
+      - requirements.txt
+      - docker/Dockerfile
+      - docker/docker-compose.yml
+      - .dockerignore
+      - .github/workflows/deploy.yml
+      - .github/workflows/ci.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-collector-main
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ github.sha }}
+            ${{ steps.image.outputs.name }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    environment: production
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DEPLOY_PATH: ${{ secrets.VPS_DEPLOY_PATH }}
+          DEPLOY_SHA: ${{ github.sha }}
+          COLLECTOR_IMAGE: ${{ needs.build.outputs.image }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          host: ${{ secrets.VPS_SSH_HOST }}
+          username: ${{ secrets.VPS_SSH_USER }}
+          key: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          command_timeout: 15m
+          envs: DEPLOY_PATH,DEPLOY_SHA,COLLECTOR_IMAGE,GHCR_USER,GHCR_TOKEN
+          script: |
+            set -euo pipefail
+
+            if [ -z "${DEPLOY_PATH:-}" ]; then
+              echo "ERROR: secret VPS_DEPLOY_PATH is empty"
+              exit 1
+            fi
+
+            if [ ! -d "${DEPLOY_PATH}/.git" ]; then
+              echo "ERROR: ${DEPLOY_PATH} is not a git repo (no .git)"
+              exit 1
+            fi
+
+            cd "${DEPLOY_PATH}"
+            echo "Deploy path: $(pwd)"
+
+            # Только docker/docker-compose.yml берётся из git; код приходит в образе.
+            git fetch origin main
+            git reset --hard "${DEPLOY_SHA}"
+            git log -1 --oneline
+
+            cd docker
+            test -f .env || { echo "ERROR: docker/.env missing on server"; exit 1; }
+
+            export COLLECTOR_IMAGE COLLECTOR_IMAGE_TAG="${DEPLOY_SHA}"
+
+            if docker ps >/dev/null 2>&1; then
+              DOCKER="docker"
+            else
+              DOCKER="sudo --preserve-env=COLLECTOR_IMAGE,COLLECTOR_IMAGE_TAG docker"
+            fi
+
+            # GITHUB_TOKEN живёт только во время job, долгоживущих токенов на сервере нет.
+            echo "${GHCR_TOKEN}" | $DOCKER login ghcr.io -u "${GHCR_USER}" --password-stdin
+            trap '$DOCKER logout ghcr.io >/dev/null 2>&1 || true' EXIT
+
+            # Обновляется только collector; prometheus, alertmanager и webhook не трогаем.
+            for attempt in 1 2 3; do
+              if $DOCKER compose pull collector; then
+                break
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                echo "ERROR: docker compose pull failed after 3 attempts"
+                exit 1
+              fi
+              echo "pull failed (attempt ${attempt}), retrying in 15s"
+              sleep 15
+            done
+
+            $DOCKER compose up -d --no-deps --no-build --wait --wait-timeout 180 collector
+            $DOCKER compose ps collector
+
+            STARTUP_LOGS="$($DOCKER compose logs --no-log-prefix collector)"
+            if grep -q "Working without storage" <<< "${STARTUP_LOGS}"; then
+              echo "ERROR: collector started without PostgreSQL storage"
+              $DOCKER compose logs --tail=50 collector
+              exit 1
+            fi
+
+            # events_total появляется в /metrics только после первых сообщений от OKX.
+            for i in $(seq 1 18); do
+              if $DOCKER compose exec -T collector python -c "import sys, urllib.request; body = urllib.request.urlopen('http://127.0.0.1:9108/metrics', timeout=5).read().decode(); sys.exit(0 if 'events_total{' in body else 1)"; then
+                echo "OK: collector receives market data"
+                exit 0
+              fi
+              sleep 5
+            done
+
+            echo "ERROR: no events from OKX within 90s after start"
+            $DOCKER compose logs --tail=50 collector
+            exit 1

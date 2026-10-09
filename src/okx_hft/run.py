@@ -1,5 +1,6 @@
 
 import asyncio
+import signal
 from okx_hft.config.settings import Settings
 from okx_hft.ws.client import OKXWebSocketClient
 from okx_hft.metrics.server import run_metrics_server
@@ -8,7 +9,25 @@ from okx_hft.utils.logging import get_logger
 log = get_logger(__name__)
 
 
+def _install_stop_signal_handlers() -> None:
+    """SIGTERM/SIGINT отменяют main(), чтобы отработал finally с финальным сбросом.
+
+    Без этого `docker stop` убивает процесс по SIGTERM без сброса батчей.
+    """
+    loop = asyncio.get_running_loop()
+    main_task = asyncio.current_task()
+    if main_task is None:
+        return
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, main_task.cancel)
+        except NotImplementedError:
+            # Windows: add_signal_handler не поддерживается, остаётся KeyboardInterrupt
+            pass
+
+
 async def main() -> None:
+    _install_stop_signal_handlers()
     settings = Settings()
     log.info(f"settings_loaded: {settings.model_dump()}")
     metrics_task = asyncio.create_task(run_metrics_server(port=settings.METRICS_PORT))
@@ -55,4 +74,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except asyncio.CancelledError:
+        log.info("Коллектор остановлен по сигналу")
