@@ -40,11 +40,12 @@ Workflow:
 | `VPS_SSH_HOST` | IP сервера collector |
 | `VPS_SSH_USER` | пользователь деплоя |
 | `VPS_SSH_PRIVATE_KEY` | приватный deploy-ключ целиком |
-| `VPS_DEPLOY_PATH` | корень клона репозитория, например `/opt/okx-hft-collector` |
+| `VPS_DEPLOY_PATH` | `/opt/hft/okx-hft-collector` |
 
 ### Окружение и ветка
 
 - **Settings** → **Environments** → `production` → **Required reviewers** (себя), **Deployment branches** → `main`.
+- Снять **Allow administrators to bypass configured protection rules** — иначе admin деплоит без Approve.
 - **Settings** → **Branches** → правило для `main`: merge только через PR, обязательные проверки `test` и `docker`.
 
 ---
@@ -52,7 +53,7 @@ Workflow:
 ## 3. Однократная настройка сервера
 
 ```bash
-cd /opt/okx-hft-collector          # VPS_DEPLOY_PATH
+cd /opt/hft/okx-hft-collector       # VPS_DEPLOY_PATH
 git status                          # локальных правок быть не должно: деплой делает git reset --hard
 test -f docker/.env && chmod 600 docker/.env
 docker compose version              # нужна v2.17+ для `up --wait --wait-timeout`
@@ -86,7 +87,7 @@ Collector должен быть запущен из `docker/` этого кло�
 Вручную на сервере:
 
 ```bash
-cd /opt/okx-hft-collector
+cd /opt/hft/okx-hft-collector
 git fetch origin && git reset --hard <старый_sha>
 cd docker
 COLLECTOR_IMAGE_TAG=<старый_sha> docker compose pull collector
